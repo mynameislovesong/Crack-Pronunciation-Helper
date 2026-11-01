@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         Crack 일본어 대사 한글 발음 호버
 // @namespace    https://crack.wrtn.ai/
-// @version      1.2.2
+// @version      1.3.0
 // @description  Crack의 일본어 대사에 마우스를 올리면 Gemini로 변환한 한글 발음을 표시합니다.
-// @author       User
+// @author       Codex
 // @match        https://crack.wrtn.ai/*
 // @run-at       document-idle
 // @grant        GM_getValue
@@ -63,6 +63,13 @@
 설명, 번호, 괄호, 따옴표, 일본어 원문, 한국어 번역문을 덧붙이지 마세요.
 입력이 여러 단위로 주어지면 입력 순서와 index를 정확히 보존하세요.`;
 
+    const LITERAL_TRANSLATION_PROMPT = `당신은 일본어 원문의 의미를 충실하게 한국어로 옮기는 번역가입니다.
+원문의 어휘, 문법적 관계, 부정·긍정, 시제, 호칭, 어미, 감정 강도를 최대한 보존하십시오.
+문장을 과도하게 의역하거나 원문에 없는 감정, 설명, 애교, 관계성, 행동을 추가하지 마십시오.
+일본어의 표현 구조를 이해할 수 있도록 원문에 가까운 한국어를 작성하되, 한국어 문장으로 이해 가능한 최소한의 자연스러움은 유지하십시오.
+원문의 뉘앙스를 멋대로 과장하지 말고, 말끝의 어조와 존댓말·반말 구분을 유지하며, 캐릭터 말투를 임의로 바꾸지 마십시오.
+해설, 감상, 인사말, 부연 설명 없이 직역 결과만 출력하십시오.`;
+
     const DEFAULT_RULES = [
         {
             id: 'jp-quotes',
@@ -109,6 +116,7 @@
     const DEFAULT_CONFIG = {
         uxVersion: 2,
         enabled: true,
+        literalTranslationEnabled: false,
         hoverMode: 'sentence',
         hoverDelay: 250,
         dialogueFormat: 'jp',
@@ -122,6 +130,7 @@
         model: 'gemini-3.8-flash',
         firebaseConfig: {},
         firebaseConfigSource: '',
+        firebaseAppCheckDebugToken: '',
         firebaseSdkVersion: '12.12.0',
         firebaseLocation: 'global',
         prompt: DEFAULT_PROMPT,
@@ -237,6 +246,8 @@
         merged.customDialogueStart = String(merged.customDialogueStart ?? '「');
         merged.customDialogueEnd = String(merged.customDialogueEnd ?? '」');
         merged.useAdvancedRules = !!merged.useAdvancedRules;
+        merged.literalTranslationEnabled = !!merged.literalTranslationEnabled;
+        merged.firebaseAppCheckDebugToken = String(merged.firebaseAppCheckDebugToken || '').trim();
         if (!['google', 'firebase'].includes(merged.provider)) merged.provider = 'google';
         if (!['auto', 'top', 'bottom'].includes(merged.tooltip.position)) merged.tooltip.position = 'auto';
         if (!Object.hasOwn(TOOLTIP_FONT_STACKS, merged.tooltip.fontFamily)) merged.tooltip.fontFamily = DEFAULT_CONFIG.tooltip.fontFamily;
@@ -259,6 +270,7 @@
         let text = String(message || '알 수 없는 오류');
         if (config.apiKey) text = text.split(config.apiKey).join('[API KEY]');
         if (config.firebaseConfig?.apiKey) text = text.split(config.firebaseConfig.apiKey).join('[FIREBASE API KEY]');
+        if (config.firebaseAppCheckDebugToken) text = text.split(config.firebaseAppCheckDebugToken).join('[APP CHECK DEBUG TOKEN]');
         return text.replace(/AIza[\w-]{20,}/g, '[API KEY]');
     }
 
@@ -266,6 +278,8 @@
     const FIREBASE_REQUIRED = ['apiKey', 'projectId', 'appId'];
     const FIREBASE_APP_NAME = 'cjkh-firebase-ai';
     let firebaseModuleCache = null;
+    let firebaseRuntimeSignature = '';
+    let firebaseActiveDebugTokenHash = '';
 
     // Firebase 콘솔에서 복사한 JSON 또는 `const firebaseConfig = {...}`를 eval 없이 읽습니다.
     function parseFirebaseConfigText(text) {
@@ -746,6 +760,34 @@
         return payload;
     }
 
+    function buildLiteralTranslationPayload(source) {
+        const payload = {
+            systemInstruction: { parts: [{ text: LITERAL_TRANSLATION_PROMPT }] },
+            contents: [{
+                role: 'user',
+                parts: [{ text: `다음 일본어 문장 하나만 한국어로 직역하십시오. 결과 외에는 아무것도 출력하지 마십시오.\n${source}` }],
+            }],
+            generationConfig: {
+                maxOutputTokens: Math.min(4096, Math.max(256, String(source).length * 4)),
+                responseMimeType: 'text/plain',
+            },
+        };
+        if (/^gemini-3(?:[.-]|$)/.test(config.model)) {
+            payload.generationConfig.thinkingConfig = { thinkingLevel: 'low' };
+        }
+        return payload;
+    }
+
+    function normalizeLiteralTranslation(value) {
+        const result = String(value || '')
+            .replace(/^```(?:text|markdown)?\s*/i, '')
+            .replace(/\s*```$/i, '')
+            .replace(/^\s*(?:직역|번역)\s*[:：]\s*/u, '')
+            .trim();
+        if (!result) throw new Error('직역 결과가 비어 있습니다.');
+        return result;
+    }
+
     function normalizeApiResults(parsed, segments) {
         const list = Array.isArray(parsed) ? parsed : parsed?.results;
         if (!Array.isArray(list)) throw new Error('응답 JSON에 results 배열이 없습니다.');
@@ -779,24 +821,33 @@
     }
 
     async function loadFirebaseModules() {
-        if (firebaseModuleCache) return firebaseModuleCache;
+        const withAppCheck = !!config.firebaseAppCheckDebugToken;
+        const cacheKey = `${config.firebaseSdkVersion}:${withAppCheck ? 'app-check' : 'base'}`;
+        if (firebaseModuleCache?.key === cacheKey) return firebaseModuleCache.promise;
         const base = `https://www.gstatic.com/firebasejs/${config.firebaseSdkVersion}/`;
-        firebaseModuleCache = Promise.all([
+        const imports = [
             import(`${base}firebase-app.js`),
             import(`${base}firebase-ai.js`),
-        ]).catch((error) => {
-            firebaseModuleCache = null;
+        ];
+        if (withAppCheck) imports.push(import(`${base}firebase-app-check.js`));
+        const promise = Promise.all(imports).catch((error) => {
+            if (firebaseModuleCache?.key === cacheKey) firebaseModuleCache = null;
             throw new Error(`Firebase SDK(${config.firebaseSdkVersion})를 불러오지 못했습니다: ${error.message}`);
         });
-        return firebaseModuleCache;
+        firebaseModuleCache = { key: cacheKey, promise };
+        return promise;
     }
 
     function firebaseError(error) {
-        const message = String(error?.message || error || 'Firebase 요청 실패');
+        const message = redact(error?.message || error || 'Firebase 요청 실패');
         const code = String(error?.code || '');
         const status = Number(error?.customErrorData?.status || 0);
         let hint = '';
-        if (/app.?check/i.test(message + code)) hint = ' App Check가 강제 적용된 프로젝트는 유저스크립트에서 사용할 수 없습니다.';
+        if (/app.?check/i.test(message + code)) {
+            hint = config.firebaseAppCheckDebugToken
+                ? ' 디버그 토큰이 Firebase Console의 해당 웹 앱에 등록되어 있는지 확인하세요.'
+                : ' App Check가 강제된 프로젝트는 등록된 디버그 토큰이나 정식 Web provider가 필요합니다.';
+        }
         else if (/billing/i.test(message)) hint = ' Vertex AI 백엔드는 Blaze 결제 연결이 필요할 수 있습니다.';
         else if (/permission|forbidden|403/i.test(message) || status === 403) hint = ' Firebase AI Logic 및 Vertex AI 권한과 웹 API 키의 HTTP 리퍼러 제한을 확인하세요.';
         else if (/not found|404|model/i.test(message) || status === 404) hint = ' 모델 ID와 Vertex AI 리전을 확인하세요.';
@@ -805,41 +856,100 @@
         return result;
     }
 
-    async function requestFirebaseOnce(segments, structured = true, spacingRepair = false) {
-        validateFirebaseSettings();
-        const [appMod, aiMod] = await loadFirebaseModules();
+    async function initializeDebugAppCheck(app, appCheckMod, debugToken) {
+        if (!appCheckMod?.initializeAppCheck || !appCheckMod?.CustomProvider) {
+            throw new Error(`Firebase SDK ${config.firebaseSdkVersion}의 App Check 모듈을 사용할 수 없습니다.`);
+        }
+        const globalScope = typeof self !== 'undefined' ? self : globalThis;
+        const hadPrevious = Object.prototype.hasOwnProperty.call(globalScope, 'FIREBASE_APPCHECK_DEBUG_TOKEN');
+        const previousToken = globalScope.FIREBASE_APPCHECK_DEBUG_TOKEN;
+        const originalLog = console.log;
+        const safeLog = (...args) => originalLog.apply(console, args.map((value) => (
+            typeof value === 'string' ? value.split(debugToken).join('[APP CHECK DEBUG TOKEN]') : value
+        )));
+        globalScope.FIREBASE_APPCHECK_DEBUG_TOKEN = debugToken;
+        console.log = safeLog;
         try {
-            let app = appMod.getApps().find((item) => item.name === FIREBASE_APP_NAME);
-            const changed = app && Object.keys({ ...app.options, ...config.firebaseConfig })
-                .some((key) => app.options[key] !== config.firebaseConfig[key]);
-            if (changed) {
-                await appMod.deleteApp(app);
-                app = null;
-            }
-            if (!app) app = appMod.initializeApp({ ...config.firebaseConfig }, FIREBASE_APP_NAME);
-            const VertexBackend = aiMod.AgentPlatformBackend || aiMod.VertexAIBackend;
-            if (!VertexBackend) throw new Error(`Firebase SDK ${config.firebaseSdkVersion}에 Vertex AI 백엔드가 없습니다.`);
-            const ai = aiMod.getAI(app, { backend: new VertexBackend(config.firebaseLocation) });
-            const payload = buildApiPayload(segments, structured, spacingRepair);
-            const generationConfig = { ...payload.generationConfig };
-            if (generationConfig.thinkingConfig?.thinkingLevel && aiMod.ThinkingLevel) {
-                const level = generationConfig.thinkingConfig.thinkingLevel.toUpperCase();
-                generationConfig.thinkingConfig = { thinkingLevel: aiMod.ThinkingLevel[level] || generationConfig.thinkingConfig.thinkingLevel };
-            }
-            const model = aiMod.getGenerativeModel(ai, {
-                model: config.model,
-                systemInstruction: payload.systemInstruction,
-                generationConfig,
-            }, { timeout: config.requestTimeout });
-            let timer;
-            const timeout = new Promise((_, reject) => {
-                timer = window.setTimeout(() => reject(new Error(`요청 시간이 ${Math.round(config.requestTimeout / 1000)}초를 초과했습니다.`)), config.requestTimeout + 1000);
+            const provider = new appCheckMod.CustomProvider({
+                getToken: async () => { throw new Error('App Check 디버그 모드가 활성화되지 않았습니다.'); },
             });
-            let result;
-            try { result = await Promise.race([model.generateContent({ contents: payload.contents }), timeout]); }
-            finally { clearTimeout(timer); }
-            const text = String(result.response.text() || '').replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
-            if (!text) throw new Error('Firebase가 빈 응답을 반환했습니다.');
+            const appCheck = appCheckMod.initializeAppCheck(app, {
+                provider,
+                isTokenAutoRefreshEnabled: true,
+            });
+            // SDK가 디버그 토큰을 콘솔에 알리는 마이크로태스크까지 마스킹합니다.
+            await Promise.resolve();
+            return appCheck;
+        } finally {
+            if (console.log === safeLog) console.log = originalLog;
+            if (hadPrevious) globalScope.FIREBASE_APPCHECK_DEBUG_TOKEN = previousToken;
+            else delete globalScope.FIREBASE_APPCHECK_DEBUG_TOKEN;
+        }
+    }
+
+    async function ensureFirebaseRuntime() {
+        validateFirebaseSettings();
+        const modules = await loadFirebaseModules();
+        const [appMod, aiMod, appCheckMod] = modules;
+        const debugToken = config.firebaseAppCheckDebugToken;
+        const debugTokenHash = debugToken ? await sha256(debugToken) : '';
+        if (debugTokenHash && firebaseActiveDebugTokenHash && debugTokenHash !== firebaseActiveDebugTokenHash) {
+            throw new Error('App Check 디버그 토큰을 변경했습니다. 새 토큰 적용을 위해 페이지를 한 번 새로고침해 주세요.');
+        }
+        const signature = await sha256(JSON.stringify({
+            sdk: config.firebaseSdkVersion,
+            firebaseConfig: config.firebaseConfig,
+            appCheckDebugTokenHash: debugTokenHash,
+        }));
+        let app = appMod.getApps().find((item) => item.name === FIREBASE_APP_NAME);
+        const optionsChanged = app && Object.keys({ ...app.options, ...config.firebaseConfig })
+            .some((key) => app.options[key] !== config.firebaseConfig[key]);
+        const runtimeChanged = app && firebaseRuntimeSignature && firebaseRuntimeSignature !== signature;
+        const appCheckNeedsFreshApp = app && debugToken && firebaseRuntimeSignature !== signature;
+        if (app && (optionsChanged || runtimeChanged || appCheckNeedsFreshApp)) {
+            await appMod.deleteApp(app);
+            app = null;
+        }
+        if (!app) app = appMod.initializeApp({ ...config.firebaseConfig }, FIREBASE_APP_NAME);
+        if (debugToken && firebaseRuntimeSignature !== signature) {
+            await initializeDebugAppCheck(app, appCheckMod, debugToken);
+            firebaseActiveDebugTokenHash = debugTokenHash;
+        }
+        firebaseRuntimeSignature = signature;
+        return { app, aiMod };
+    }
+
+    async function requestFirebasePayload(payload) {
+        const { app, aiMod } = await ensureFirebaseRuntime();
+        const VertexBackend = aiMod.AgentPlatformBackend || aiMod.VertexAIBackend;
+        if (!VertexBackend) throw new Error(`Firebase SDK ${config.firebaseSdkVersion}에 Vertex AI 백엔드가 없습니다.`);
+        const ai = aiMod.getAI(app, { backend: new VertexBackend(config.firebaseLocation) });
+        const generationConfig = { ...payload.generationConfig };
+        if (generationConfig.thinkingConfig?.thinkingLevel && aiMod.ThinkingLevel) {
+            const level = generationConfig.thinkingConfig.thinkingLevel.toUpperCase();
+            generationConfig.thinkingConfig = { thinkingLevel: aiMod.ThinkingLevel[level] || generationConfig.thinkingConfig.thinkingLevel };
+        }
+        const model = aiMod.getGenerativeModel(ai, {
+            model: config.model,
+            systemInstruction: payload.systemInstruction,
+            generationConfig,
+        }, { timeout: config.requestTimeout });
+        let timer;
+        const timeout = new Promise((_, reject) => {
+            timer = window.setTimeout(() => reject(new Error(`요청 시간이 ${Math.round(config.requestTimeout / 1000)}초를 초과했습니다.`)), config.requestTimeout + 1000);
+        });
+        let result;
+        try { result = await Promise.race([model.generateContent({ contents: payload.contents }), timeout]); }
+        finally { clearTimeout(timer); }
+        const text = String(result.response.text() || '').replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+        if (!text) throw new Error('Firebase가 빈 응답을 반환했습니다.');
+        return text;
+    }
+
+    async function requestFirebaseOnce(segments, structured = true, spacingRepair = false) {
+        try {
+            const payload = buildApiPayload(segments, structured, spacingRepair);
+            const text = await requestFirebasePayload(payload);
             let parsed;
             try { parsed = JSON.parse(text); }
             catch (_) { throw new Error('Firebase가 올바른 JSON 결과를 반환하지 않았습니다.'); }
@@ -908,6 +1018,82 @@
         throw lastError || new Error('Gemini 요청에 실패했습니다.');
     }
 
+    async function requestLiteralTranslationOnce(source) {
+        const model = String(config.model || '').trim();
+        if (!/^[A-Za-z0-9._-]+$/.test(model)) throw new Error('모델 ID 형식이 올바르지 않습니다.');
+        const payload = buildLiteralTranslationPayload(source);
+        if (config.provider === 'firebase') {
+            try { return normalizeLiteralTranslation(await requestFirebasePayload(payload)); }
+            catch (error) { throw firebaseError(error); }
+        }
+        const apiKey = String(config.apiKey || '').trim();
+        if (!apiKey) throw new Error('설정에서 Gemini API 키를 입력해 주세요.');
+        const url = `${API_ORIGIN}/v1beta/models/${encodeURIComponent(model)}:generateContent`;
+        const response = await gmRequest({
+            url,
+            headers: {
+                'Content-Type': 'application/json',
+                'x-goog-api-key': apiKey,
+            },
+            data: JSON.stringify(payload),
+            timeout: config.requestTimeout,
+        });
+        if (response.status < 200 || response.status >= 300) {
+            const error = new Error(parseApiError(response));
+            error.status = response.status;
+            throw error;
+        }
+        let responsePayload;
+        try { responsePayload = JSON.parse(response.responseText || '{}'); }
+        catch (_) { throw new Error('Gemini 응답을 JSON으로 읽지 못했습니다.'); }
+        return normalizeLiteralTranslation(extractCandidateText(responsePayload));
+    }
+
+    async function requestLiteralTranslation(source) {
+        let lastError;
+        const attempts = Math.max(1, config.retryCount + 1);
+        for (let attempt = 0; attempt < attempts; attempt += 1) {
+            try { return await requestLiteralTranslationOnce(source); }
+            catch (error) {
+                lastError = error;
+                const retryable = !error.status || error.status === 429 || error.status >= 500;
+                if (!retryable || attempt >= attempts - 1) break;
+                await new Promise((resolve) => window.setTimeout(resolve, 700 * (attempt + 1)));
+            }
+        }
+        throw lastError || new Error('직역 요청에 실패했습니다.');
+    }
+
+    async function literalTranslationKey(source) {
+        return sha256(JSON.stringify({
+            version: CACHE_FORMAT_VERSION,
+            kind: 'literal-translation-v1',
+            provider: config.provider,
+            backendProject: config.provider === 'firebase' ? config.firebaseConfig?.projectId || '' : '',
+            backendLocation: config.provider === 'firebase' ? config.firebaseLocation : '',
+            model: config.model,
+            prompt: LITERAL_TRANSLATION_PROMPT,
+            source,
+        }));
+    }
+
+    async function convertLiteralTranslation(source, { bypassCache = false } = {}) {
+        const key = await literalTranslationKey(source);
+        if (!bypassCache) {
+            const cached = CacheStore.get(key);
+            if (cached?.[0]) return cached[0];
+        }
+        if (pendingRequests.has(key)) return pendingRequests.get(key);
+        const promise = requestLiteralTranslation(source)
+            .then((result) => {
+                CacheStore.set(key, [result]);
+                return result;
+            })
+            .finally(() => pendingRequests.delete(key));
+        pendingRequests.set(key, promise);
+        return promise;
+    }
+
     async function conversionKey(segments) {
         return sha256(JSON.stringify({
             version: CACHE_FORMAT_VERSION,
@@ -952,6 +1138,15 @@
             #tooltip{position:fixed;display:none;z-index:3;padding:6px 9px;border:1px solid rgba(55,65,81,.16);border-radius:7px;box-shadow:0 3px 12px rgba(15,23,42,.14);font-family:system-ui,-apple-system,"Segoe UI",sans-serif;font-weight:500;line-height:1.5;letter-spacing:-.02em;white-space:pre-wrap;overflow-wrap:anywhere;word-break:keep-all;pointer-events:none}
             #tooltip.loading{color:#6b7280!important;box-shadow:0 2px 8px rgba(15,23,42,.10)}
             #tooltip.error{color:#991b1b!important;background:#fff7f7!important;border-color:#fecaca!important}
+            #tooltip.translation-open{pointer-events:auto;max-height:calc(100vh - 16px);overflow-y:auto}
+            .translation-divider{height:1px;margin:7px 0 6px;background:rgba(55,65,81,.14)}
+            .translation-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:3px}
+            .translation-title{font-weight:700}
+            .translation-close{border:0;background:transparent;color:inherit;font:600 15px/1 system-ui,sans-serif;cursor:pointer;opacity:.58;padding:1px 2px}
+            .translation-body{font-weight:500;white-space:pre-wrap;overflow-wrap:anywhere}
+            .translation-loading{color:#6b7280;font-weight:400}
+            .translation-error{color:#991b1b}
+            .translation-retry{margin-top:5px;border:1px solid rgba(153,27,27,.28);border-radius:5px;background:transparent;color:#991b1b;font:600 11px/1.2 system-ui,sans-serif;padding:4px 7px;cursor:pointer}
             #panel{position:fixed;inset:0;z-index:5;background:rgba(0,0,0,.48);display:grid;place-items:center;padding:18px;font-family:system-ui,-apple-system,"Noto Sans KR",sans-serif;color:#111827}
             #panel[hidden]{display:none}
             .box{width:min(760px,calc(100vw - 24px));height:min(720px,calc(100vh - 24px));background:#fff;border-radius:18px;box-shadow:0 24px 80px rgba(0,0,0,.35);display:flex;flex-direction:column;overflow:hidden}
@@ -1055,9 +1250,17 @@
         return rectCount;
     }
 
+    let tooltipBaseText = '';
+    let tooltipBaseState = '';
+    let translationSession = null;
+    let translationRequestToken = 0;
+
     function hideTooltip() {
+        tooltipBaseText = '';
+        tooltipBaseState = '';
         tooltip.style.display = 'none';
-        tooltip.classList.remove('loading', 'error');
+        tooltip.classList.remove('loading', 'error', 'translation-open');
+        tooltip.replaceChildren();
     }
 
     function clearHoverHighlight() {
@@ -1111,12 +1314,58 @@
         tooltip.style.top = `${Math.round(top)}px`;
     }
 
-    function showTooltip(text, range, state = '') {
-        tooltip.textContent = text;
-        tooltip.classList.toggle('loading', state === 'loading');
-        tooltip.classList.toggle('error', state === 'error');
+    function renderTooltip(range = activeHit?.unit.range) {
+        tooltip.replaceChildren();
+        const pronunciation = document.createElement('div');
+        pronunciation.className = 'tooltip-pronunciation';
+        pronunciation.textContent = tooltipBaseText || '발음 변환 중…';
+        tooltip.appendChild(pronunciation);
+        tooltip.classList.toggle('loading', tooltipBaseState === 'loading');
+        tooltip.classList.toggle('error', tooltipBaseState === 'error');
+        tooltip.classList.toggle('translation-open', !!translationSession);
+        if (translationSession) {
+            const divider = document.createElement('div');
+            divider.className = 'translation-divider';
+            const head = document.createElement('div');
+            head.className = 'translation-head';
+            const title = document.createElement('div');
+            title.className = 'translation-title';
+            title.textContent = '직역';
+            const close = document.createElement('button');
+            close.type = 'button';
+            close.className = 'translation-close';
+            close.dataset.translationClose = '';
+            close.setAttribute('aria-label', '직역 닫기');
+            close.textContent = '×';
+            head.append(title, close);
+            const body = document.createElement('div');
+            body.className = 'translation-body';
+            if (translationSession.status === 'loading') {
+                body.classList.add('translation-loading');
+                body.textContent = '직역 중…';
+            } else if (translationSession.status === 'error') {
+                body.classList.add('translation-error');
+                const message = document.createElement('div');
+                message.textContent = translationSession.error || '직역에 실패했습니다.';
+                const retry = document.createElement('button');
+                retry.type = 'button';
+                retry.className = 'translation-retry';
+                retry.dataset.translationRetry = '';
+                retry.textContent = '재시도';
+                body.append(message, retry);
+            } else {
+                body.textContent = translationSession.result || '';
+            }
+            tooltip.append(divider, head, body);
+        }
         tooltip.style.display = 'block';
-        positionTooltip(range);
+        if (range) positionTooltip(range);
+    }
+
+    function showTooltip(text, range, state = '') {
+        tooltipBaseText = String(text || '');
+        tooltipBaseState = state;
+        renderTooltip(range);
     }
 
     const rootIds = new WeakMap();
@@ -1137,6 +1386,50 @@
         return `${getRootId(hit.root)}:${hit.unit.start}:${hit.unit.end}:${configRevision}`;
     }
 
+    function closeLiteralTranslation({ recheckPointer = true } = {}) {
+        if (!translationSession) return;
+        translationRequestToken += 1;
+        translationSession = null;
+        if (activeHit && tooltipBaseText) renderTooltip(activeHit.unit.range);
+        else hideTooltip();
+        if (!recheckPointer || !latestPointer || !config.enabled || !panel.hidden) return;
+        const pointedHit = hitTest(latestPointer.target, latestPointer.clientX, latestPointer.clientY);
+        if (hitIdentity(pointedHit) !== hitIdentity(activeHit)) setActiveHit(pointedHit);
+    }
+
+    async function startLiteralTranslation(hit, { bypassCache = false } = {}) {
+        if (!config.enabled || !config.literalTranslationEnabled || !hit) return;
+        const identity = hitIdentity(hit);
+        if (translationSession?.identity === identity && translationSession.status !== 'error') {
+            renderTooltip(hit.unit.range);
+            return;
+        }
+        const token = ++translationRequestToken;
+        translationSession = {
+            identity,
+            hit,
+            source: hit.unit.source,
+            status: 'loading',
+            result: '',
+            error: '',
+        };
+        activeHit = hit;
+        showHoverHighlight(hit.unit.range);
+        renderTooltip(hit.unit.range);
+        try {
+            const result = await convertLiteralTranslation(hit.unit.source, { bypassCache });
+            if (token !== translationRequestToken || !translationSession || translationSession.identity !== identity) return;
+            translationSession.status = 'ready';
+            translationSession.result = result;
+            renderTooltip(hit.unit.range);
+        } catch (error) {
+            if (token !== translationRequestToken || !translationSession || translationSession.identity !== identity) return;
+            translationSession.status = 'error';
+            translationSession.error = redact(error.message);
+            renderTooltip(hit.unit.range);
+        }
+    }
+
     async function resolveHover(hit, token) {
         try {
             if (config.tooltip.showLoading) showTooltip('발음 변환 중…', hit.unit.range, 'loading');
@@ -1153,6 +1446,18 @@
     function setActiveHit(hit) {
         const before = hitIdentity(activeHit);
         const after = hitIdentity(hit);
+        if (translationSession) {
+            if (!config.enabled || !panel.hidden) {
+                closeLiteralTranslation({ recheckPointer: false });
+            } else if (!hit || after === translationSession.identity) {
+                activeHit = translationSession.hit;
+                showHoverHighlight(activeHit.unit.range);
+                if (tooltip.style.display !== 'none') positionTooltip(activeHit.unit.range);
+                return;
+            } else {
+                closeLiteralTranslation({ recheckPointer: false });
+            }
+        }
         if (before === after) {
             if (hit && tooltip.style.display !== 'none') positionTooltip(hit.unit.range);
             return;
@@ -1182,6 +1487,45 @@
         latestPointer = { target: event.target, clientX: event.clientX, clientY: event.clientY };
         if (!pointerFrame) pointerFrame = requestAnimationFrame(processPointer);
     }, { capture: true, passive: true });
+
+    document.addEventListener('contextmenu', (event) => {
+        if (!config.enabled || !config.literalTranslationEnabled || !panel.hidden || !activeHit) return;
+        if (window.matchMedia && !window.matchMedia('(hover: hover) and (pointer: fine)').matches) return;
+        const target = event.target instanceof Element ? event.target : event.target?.parentElement;
+        if (!target || target.closest('a, img, input, textarea, select, button, [contenteditable="true"]')) return;
+        const overHighlightedSentence = [...activeHit.unit.range.getClientRects()]
+            .some((rect) => rectContains(rect, event.clientX, event.clientY));
+        if (!overHighlightedSentence) return;
+        event.preventDefault();
+        event.stopPropagation();
+        startLiteralTranslation(activeHit);
+    }, true);
+
+    document.addEventListener('pointerdown', (event) => {
+        if (!translationSession || event.button !== 0 || event.composedPath().includes(tooltip)) return;
+        closeLiteralTranslation();
+    }, true);
+
+    tooltip.addEventListener('click', (event) => {
+        const close = event.target.closest('[data-translation-close]');
+        if (close) {
+            event.preventDefault();
+            closeLiteralTranslation();
+            return;
+        }
+        const retry = event.target.closest('[data-translation-retry]');
+        if (retry && translationSession) {
+            event.preventDefault();
+            startLiteralTranslation(translationSession.hit, { bypassCache: true });
+        }
+    });
+
+    document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape' && translationSession && panel.hidden) {
+            event.preventDefault();
+            closeLiteralTranslation();
+        }
+    }, true);
 
     document.addEventListener('pointerleave', () => setActiveHit(null), { capture: true, passive: true });
     window.addEventListener('blur', () => setActiveHit(null), { passive: true });
@@ -1230,6 +1574,8 @@
                 <div class="section">
                     <h3>기본 동작</h3>
                     <div class="checkrow"><label for="cfg-enabled">기능 전체 사용</label><input id="cfg-enabled" type="checkbox"></div>
+                    <div class="checkrow"><label for="cfg-literal-translation">강조 문장 우클릭 직역</label><input id="cfg-literal-translation" type="checkbox"></div>
+                    <div class="small">기본값은 꺼짐입니다. 켜면 형광펜으로 강조된 문장을 우클릭할 때만 같은 툴팁에 직역을 표시합니다.</div>
                     <div class="row"><div class="col"><label for="cfg-mode">발음 표시 범위</label><select id="cfg-mode"><option value="dialogue">대사 전체</option><option value="sentence">문장별</option></select></div><div class="col"><label for="cfg-delay">호버 대기 시간</label><select id="cfg-delay"><option value="0">즉시</option><option value="200">0.2초</option><option value="250">0.25초</option><option value="350">0.35초</option><option value="500">0.5초</option><option value="800">0.8초</option></select></div></div>
                     <div class="small">대사 전체는 어느 부분에 커서를 올려도 전체 발음을, 문장별은 커서가 놓인 문장만 보여 줍니다.</div>
                 </div>
@@ -1247,6 +1593,11 @@
                         <label for="cfg-firebase-config">Firebase 웹 앱 Config</label><textarea id="cfg-firebase-config" class="mono" style="min-height:150px" placeholder='{"apiKey":"AIza…","projectId":"…","appId":"1:…:web:…"}'></textarea>
                         <div class="errorline" id="firebase-config-error"></div>
                         <div class="row"><div class="col"><label for="cfg-firebase-sdk">Firebase JS SDK 버전</label><input id="cfg-firebase-sdk" class="mono" type="text" placeholder="12.12.0"></div><div class="col"><label for="cfg-firebase-location">Vertex AI 리전</label><input id="cfg-firebase-location" class="mono" type="text" placeholder="global"></div></div>
+                        <label for="cfg-app-check-token">App Check 디버그 토큰 (선택)</label>
+                        <div class="row"><div class="col"><input id="cfg-app-check-token" class="mono" type="password" autocomplete="off" spellcheck="false" placeholder="등록된 디버그 토큰"></div><button class="btn" id="toggle-app-check-token" type="button">표시</button></div>
+                        <div class="row"><button class="btn" id="save-app-check-token" type="button">토큰 저장</button><button class="btn danger" id="delete-app-check-token" type="button">토큰 삭제</button></div>
+                        <div class="result" id="app-check-token-status"></div>
+                        <div class="small">Firebase Console의 App Check → 앱 → 디버그 토큰 관리에 먼저 등록된 토큰만 동작합니다. 개인 개발·테스트 용도로만 사용하고 외부에 공유하지 마세요.</div>
                         <div class="small">Firebase 콘솔의 웹 앱 Config만 입력하세요. 서비스 계정 JSON·비공개 키는 절대 입력하지 마세요. Vertex AI 백엔드는 프로젝트의 Firebase AI Logic 설정과 결제 연결이 필요할 수 있습니다.</div>
                     </div>
                     <div class="row"><div class="col"><label for="cfg-model-preset">모델 프리셋</label><select id="cfg-model-preset"><option value="gemini-3.8-flash">Gemini 3.8 Flash</option><option value="gemini-3.7-flash">Gemini 3.7 Flash</option><option value="gemini-3.6-flash">Gemini 3.6 Flash</option><option value="gemini-3.5-flash-lite">Gemini 3.5 Flash-Lite</option><option value="__custom__">직접 입력</option></select></div><div class="col" id="custom-model-box"><label for="cfg-model">모델 ID</label><input id="cfg-model" class="mono" type="text" spellcheck="false"></div></div>
@@ -1281,7 +1632,7 @@
             </section>
             <section class="page" data-page="data">
                 <div class="section"><h3>캐시</h3><div class="row"><div class="col"><label for="cfg-cache-max">최대 항목 수</label><input id="cfg-cache-max" type="number" min="10" max="2000"></div><div class="col"><label for="cfg-cache-days">보관 일수</label><input id="cfg-cache-days" type="number" min="1" max="365"></div></div><div class="result" id="cache-stats"></div><button class="btn danger" id="clear-cache" type="button">캐시 전체 삭제</button></div>
-                <div class="section"><h3>설정 데이터</h3><div class="row"><button class="btn" id="export-settings" type="button">설정 내보내기</button><button class="btn" id="import-settings" type="button">설정 가져오기</button><input id="import-file" type="file" accept="application/json,.json" hidden></div><div class="small">내보내기에는 API 키와 캐시가 포함되지 않습니다.</div><button class="btn danger" id="reset-settings" type="button">모든 설정 기본값 복원</button></div>
+                <div class="section"><h3>설정 데이터</h3><div class="row"><button class="btn" id="export-settings" type="button">설정 내보내기</button><button class="btn" id="import-settings" type="button">설정 가져오기</button><input id="import-file" type="file" accept="application/json,.json" hidden></div><div class="small">내보내기에는 API 키, Firebase Config, App Check 디버그 토큰과 캐시가 포함되지 않습니다.</div><button class="btn danger" id="reset-settings" type="button">모든 설정 기본값 복원</button></div>
             </section>`;
     }
 
@@ -1380,6 +1731,7 @@
 
     function fillSettings() {
         setChecked('cfg-enabled', settingsDraft.enabled);
+        setChecked('cfg-literal-translation', settingsDraft.literalTranslationEnabled);
         setValue('cfg-mode', settingsDraft.hoverMode);
         setValue('cfg-delay', settingsDraft.hoverDelay);
         setValue('cfg-dialogue-format', settingsDraft.dialogueFormat);
@@ -1391,6 +1743,10 @@
         setValue('cfg-firebase-config', settingsDraft.firebaseConfigSource || firebaseConfigText(settingsDraft.firebaseConfig));
         setValue('cfg-firebase-sdk', settingsDraft.firebaseSdkVersion);
         setValue('cfg-firebase-location', settingsDraft.firebaseLocation);
+        setValue('cfg-app-check-token', settingsDraft.firebaseAppCheckDebugToken);
+        field('app-check-token-status').textContent = settingsDraft.firebaseAppCheckDebugToken
+            ? '디버그 토큰이 로컬 설정에 저장되어 있습니다.'
+            : '디버그 토큰을 사용하지 않습니다.';
         field('google-api-section').style.display = settingsDraft.provider === 'google' ? '' : 'none';
         field('firebase-api-section').style.display = settingsDraft.provider === 'firebase' ? '' : 'none';
         const presets = ['gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.6-flash', 'gemini-3.5-flash-lite'];
@@ -1412,7 +1768,7 @@
         setChecked('cfg-loading', settingsDraft.tooltip.showLoading);
         setValue('cfg-cache-max', settingsDraft.cacheMax);
         setValue('cfg-cache-days', settingsDraft.cacheMaxAgeDays);
-        field('cache-stats').textContent = `저장된 발음: ${CacheStore.entries.size}개\n동시에 처리 중인 요청: ${pendingRequests.size}개`;
+        field('cache-stats').textContent = `저장된 발음·직역 결과: ${CacheStore.entries.size}개\n동시에 처리 중인 요청: ${pendingRequests.size}개`;
         renderRules();
         updateDetectionSimpleUi();
     }
@@ -1435,6 +1791,7 @@
 
     function bindSettingsEvents() {
         bindSimpleField('cfg-enabled', (el) => { settingsDraft.enabled = el.checked; }, 'change');
+        bindSimpleField('cfg-literal-translation', (el) => { settingsDraft.literalTranslationEnabled = el.checked; }, 'change');
         bindSimpleField('cfg-mode', (el) => { settingsDraft.hoverMode = el.value; }, 'change');
         bindSimpleField('cfg-delay', (el) => { settingsDraft.hoverDelay = el.value; }, 'change');
         bindSimpleField('cfg-dialogue-format', (el) => {
@@ -1502,6 +1859,32 @@
             const showing = input.type === 'text';
             input.type = showing ? 'password' : 'text';
             field('toggle-key').textContent = showing ? '표시' : '숨김';
+        });
+        field('toggle-app-check-token').addEventListener('click', () => {
+            const input = field('cfg-app-check-token');
+            const showing = input.type === 'text';
+            input.type = showing ? 'password' : 'text';
+            field('toggle-app-check-token').textContent = showing ? '표시' : '숨김';
+        });
+        field('save-app-check-token').addEventListener('click', () => {
+            const token = field('cfg-app-check-token').value.trim();
+            const changedAfterInitialization = !!token && !!firebaseActiveDebugTokenHash
+                && token !== config.firebaseAppCheckDebugToken;
+            settingsDraft.firebaseAppCheckDebugToken = token;
+            firebaseModuleCache = null;
+            persistConfig(settingsDraft, true);
+            field('app-check-token-status').textContent = changedAfterInitialization
+                ? '토큰을 저장했습니다. 새 토큰 적용을 위해 페이지를 한 번 새로고침해 주세요.'
+                : (token ? '디버그 토큰을 로컬 설정에 저장했습니다.' : '빈 값이므로 디버그 토큰을 사용하지 않습니다.');
+        });
+        field('delete-app-check-token').addEventListener('click', () => {
+            settingsDraft.firebaseAppCheckDebugToken = '';
+            field('cfg-app-check-token').value = '';
+            field('cfg-app-check-token').type = 'password';
+            field('toggle-app-check-token').textContent = '표시';
+            firebaseModuleCache = null;
+            persistConfig(settingsDraft, true);
+            field('app-check-token-status').textContent = '디버그 토큰을 삭제했습니다.';
         });
         field('reset-prompt').addEventListener('click', () => {
             settingsDraft.prompt = DEFAULT_PROMPT;
@@ -1588,7 +1971,7 @@
         field('clear-cache').addEventListener('click', () => {
             if (!window.confirm('저장된 발음 캐시를 모두 삭제할까요?')) return;
             CacheStore.clear();
-            field('cache-stats').textContent = '저장된 발음: 0개\n동시에 처리 중인 요청은 취소되지 않습니다.';
+            field('cache-stats').textContent = '저장된 발음·직역 결과: 0개\n동시에 처리 중인 요청은 취소되지 않습니다.';
             showToast('캐시를 삭제했습니다.');
         });
         field('export-settings').addEventListener('click', () => {
@@ -1596,6 +1979,7 @@
             delete exported.apiKey;
             delete exported.firebaseConfig;
             delete exported.firebaseConfigSource;
+            delete exported.firebaseAppCheckDebugToken;
             const data = JSON.stringify({ type: 'crack-japanese-pronunciation-settings', version: 1, exportedAt: new Date().toISOString(), config: exported }, null, 2);
             const url = URL.createObjectURL(new Blob([data], { type: 'application/json' }));
             const anchor = document.createElement('a');
@@ -1615,15 +1999,17 @@
                 const currentKey = settingsDraft.apiKey;
                 const currentFirebaseConfig = clone(settingsDraft.firebaseConfig);
                 const currentFirebaseSource = settingsDraft.firebaseConfigSource;
+                const currentAppCheckToken = settingsDraft.firebaseAppCheckDebugToken;
                 settingsDraft = mergeConfig({
                     ...incoming,
                     apiKey: currentKey,
                     firebaseConfig: currentFirebaseConfig,
                     firebaseConfigSource: currentFirebaseSource,
+                    firebaseAppCheckDebugToken: currentAppCheckToken,
                 });
                 persistConfig(settingsDraft, true);
                 renderSettings();
-                showToast('설정을 가져왔습니다. API 키는 기존 값을 유지했습니다.');
+                showToast('설정을 가져왔습니다. API 키·Firebase Config·App Check 토큰은 기존 값을 유지했습니다.');
             } catch (error) { showToast(`가져오기 실패: ${error.message}`, 4200); }
             event.target.value = '';
         });
@@ -1645,6 +2031,7 @@
     }
 
     function openSettings() {
+        closeLiteralTranslation({ recheckPointer: false });
         setActiveHit(null);
         settingsDraft = clone(config);
         panel.hidden = false;
