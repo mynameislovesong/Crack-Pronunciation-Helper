@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Crack 일본어 대사 한글 발음 호버
 // @namespace    https://crack.wrtn.ai/
-// @version      1.3.0
+// @version      1.3.1
 // @description  Crack의 일본어 대사에 마우스를 올리면 Gemini로 변환한 한글 발음을 표시합니다.
 // @author       Codex
 // @match        https://crack.wrtn.ai/*
@@ -13,6 +13,7 @@
 // @grant        GM_registerMenuCommand
 // @connect      generativelanguage.googleapis.com
 // @connect      www.gstatic.com
+// @connect      content-firebaseappcheck.googleapis.com
 // @license      MIT
 // ==/UserScript==
 
@@ -280,6 +281,7 @@
     let firebaseModuleCache = null;
     let firebaseRuntimeSignature = '';
     let firebaseActiveDebugTokenHash = '';
+    let firebaseRuntimePromise = null;
 
     // Firebase 콘솔에서 복사한 JSON 또는 `const firebaseConfig = {...}`를 eval 없이 읽습니다.
     function parseFirebaseConfigText(text) {
@@ -856,67 +858,90 @@
         return result;
     }
 
-    async function initializeDebugAppCheck(app, appCheckMod, debugToken) {
-        if (!appCheckMod?.initializeAppCheck || !appCheckMod?.CustomProvider) {
+    async function initializeDebugAppCheck(app, appCheckMod, firebaseConfig, debugToken) {
+        if (!appCheckMod?.initializeAppCheck || !appCheckMod?.CustomProvider || !appCheckMod?.getToken) {
             throw new Error(`Firebase SDK ${config.firebaseSdkVersion}의 App Check 모듈을 사용할 수 없습니다.`);
         }
-        const globalScope = typeof self !== 'undefined' ? self : globalThis;
-        const hadPrevious = Object.prototype.hasOwnProperty.call(globalScope, 'FIREBASE_APPCHECK_DEBUG_TOKEN');
-        const previousToken = globalScope.FIREBASE_APPCHECK_DEBUG_TOKEN;
-        const originalLog = console.log;
-        const safeLog = (...args) => originalLog.apply(console, args.map((value) => (
-            typeof value === 'string' ? value.split(debugToken).join('[APP CHECK DEBUG TOKEN]') : value
-        )));
-        globalScope.FIREBASE_APPCHECK_DEBUG_TOKEN = debugToken;
-        console.log = safeLog;
-        try {
-            const provider = new appCheckMod.CustomProvider({
-                getToken: async () => { throw new Error('App Check 디버그 모드가 활성화되지 않았습니다.'); },
-            });
-            const appCheck = appCheckMod.initializeAppCheck(app, {
-                provider,
-                isTokenAutoRefreshEnabled: true,
-            });
-            // SDK가 디버그 토큰을 콘솔에 알리는 마이크로태스크까지 마스킹합니다.
-            await Promise.resolve();
-            return appCheck;
-        } finally {
-            if (console.log === safeLog) console.log = originalLog;
-            if (hadPrevious) globalScope.FIREBASE_APPCHECK_DEBUG_TOKEN = previousToken;
-            else delete globalScope.FIREBASE_APPCHECK_DEBUG_TOKEN;
+        const provider = new appCheckMod.CustomProvider({
+            getToken: () => exchangeFirebaseAppCheckDebugToken(firebaseConfig, debugToken),
+        });
+        const appCheck = appCheckMod.initializeAppCheck(app, {
+            provider,
+            isTokenAutoRefreshEnabled: false,
+        });
+        // AI 인스턴스를 만들기 전에 실제 App Check 토큰 교환까지 끝내 유효성을 확인합니다.
+        await appCheckMod.getToken(appCheck, false);
+        return appCheck;
+    }
+
+    async function exchangeFirebaseAppCheckDebugToken(firebaseConfig, debugToken) {
+        const missing = FIREBASE_REQUIRED.filter((key) => !String(firebaseConfig?.[key] || '').trim());
+        if (missing.length) throw new Error(`App Check 토큰 교환에 필요한 Firebase Config가 없습니다: ${missing.join(', ')}`);
+        const response = await gmRequest({
+            url: `https://content-firebaseappcheck.googleapis.com/v1/projects/${encodeURIComponent(firebaseConfig.projectId)}/apps/${encodeURIComponent(firebaseConfig.appId)}:exchangeDebugToken?key=${encodeURIComponent(firebaseConfig.apiKey)}`,
+            headers: { 'Content-Type': 'application/json' },
+            data: JSON.stringify({ debug_token: debugToken }),
+            timeout: config.requestTimeout,
+        });
+        if (response.status < 200 || response.status >= 300) {
+            throw new Error(`App Check 디버그 토큰 교환 실패: ${redact(parseApiError(response))}`);
         }
+        let payload;
+        try { payload = JSON.parse(response.responseText || '{}'); }
+        catch (_) { throw new Error('App Check 토큰 교환 응답을 해석하지 못했습니다.'); }
+        const token = String(payload?.token || '');
+        if (!token) throw new Error('App Check 서버가 유효한 토큰을 반환하지 않았습니다.');
+        const ttlMatch = String(payload?.ttl || '').match(/^([\d.]+)s$/);
+        const ttlMs = Math.max(60, Number(ttlMatch?.[1]) || 3600) * 1000;
+        return {
+            token,
+            expireTimeMillis: Date.now() + Math.max(ttlMs / 2, ttlMs - 300000),
+        };
     }
 
     async function ensureFirebaseRuntime() {
-        validateFirebaseSettings();
-        const modules = await loadFirebaseModules();
-        const [appMod, aiMod, appCheckMod] = modules;
-        const debugToken = config.firebaseAppCheckDebugToken;
-        const debugTokenHash = debugToken ? await sha256(debugToken) : '';
-        if (debugTokenHash && firebaseActiveDebugTokenHash && debugTokenHash !== firebaseActiveDebugTokenHash) {
-            throw new Error('App Check 디버그 토큰을 변경했습니다. 새 토큰 적용을 위해 페이지를 한 번 새로고침해 주세요.');
-        }
-        const signature = await sha256(JSON.stringify({
-            sdk: config.firebaseSdkVersion,
-            firebaseConfig: config.firebaseConfig,
-            appCheckDebugTokenHash: debugTokenHash,
-        }));
-        let app = appMod.getApps().find((item) => item.name === FIREBASE_APP_NAME);
-        const optionsChanged = app && Object.keys({ ...app.options, ...config.firebaseConfig })
-            .some((key) => app.options[key] !== config.firebaseConfig[key]);
-        const runtimeChanged = app && firebaseRuntimeSignature && firebaseRuntimeSignature !== signature;
-        const appCheckNeedsFreshApp = app && debugToken && firebaseRuntimeSignature !== signature;
-        if (app && (optionsChanged || runtimeChanged || appCheckNeedsFreshApp)) {
-            await appMod.deleteApp(app);
-            app = null;
-        }
-        if (!app) app = appMod.initializeApp({ ...config.firebaseConfig }, FIREBASE_APP_NAME);
-        if (debugToken && firebaseRuntimeSignature !== signature) {
-            await initializeDebugAppCheck(app, appCheckMod, debugToken);
-            firebaseActiveDebugTokenHash = debugTokenHash;
-        }
-        firebaseRuntimeSignature = signature;
-        return { app, aiMod };
+        if (firebaseRuntimePromise) return firebaseRuntimePromise;
+        const task = (async () => {
+            validateFirebaseSettings();
+            const modules = await loadFirebaseModules();
+            const [appMod, aiMod, appCheckMod] = modules;
+            const firebaseConfig = { ...config.firebaseConfig };
+            const debugToken = config.firebaseAppCheckDebugToken;
+            const debugTokenHash = debugToken ? await sha256(debugToken) : '';
+            if (debugTokenHash && firebaseActiveDebugTokenHash && debugTokenHash !== firebaseActiveDebugTokenHash) {
+                throw new Error('App Check 디버그 토큰을 변경했습니다. 새 토큰 적용을 위해 페이지를 한 번 새로고침해 주세요.');
+            }
+            const signature = await sha256(JSON.stringify({
+                sdk: config.firebaseSdkVersion,
+                firebaseConfig,
+                appCheckDebugTokenHash: debugTokenHash,
+            }));
+            let app = appMod.getApps().find((item) => item.name === FIREBASE_APP_NAME);
+            const optionsChanged = app && Object.keys({ ...app.options, ...firebaseConfig })
+                .some((key) => app.options[key] !== firebaseConfig[key]);
+            const runtimeChanged = app && firebaseRuntimeSignature && firebaseRuntimeSignature !== signature;
+            const appCheckNeedsFreshApp = app && debugToken && firebaseRuntimeSignature !== signature;
+            if (app && (optionsChanged || runtimeChanged || appCheckNeedsFreshApp)) {
+                await appMod.deleteApp(app);
+                app = null;
+            }
+            if (!app) app = appMod.initializeApp(firebaseConfig, FIREBASE_APP_NAME);
+            if (debugToken && firebaseRuntimeSignature !== signature) {
+                try {
+                    await initializeDebugAppCheck(app, appCheckMod, firebaseConfig, debugToken);
+                    firebaseActiveDebugTokenHash = debugTokenHash;
+                } catch (error) {
+                    // 실패한 App Check 인스턴스를 같은 앱에 남겨 다음 재시도에서 중복 초기화되지 않게 합니다.
+                    try { await appMod.deleteApp(app); } catch (_) { /* 원래 인증 오류를 유지 */ }
+                    throw error;
+                }
+            }
+            firebaseRuntimeSignature = signature;
+            return { app, aiMod };
+        })();
+        firebaseRuntimePromise = task;
+        try { return await task; }
+        finally { if (firebaseRuntimePromise === task) firebaseRuntimePromise = null; }
     }
 
     async function requestFirebasePayload(payload) {
